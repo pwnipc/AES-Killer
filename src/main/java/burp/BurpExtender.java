@@ -1,23 +1,19 @@
-/*
- * To change this license header, choose License Headers in Project Properties.
- * To change this template file, choose Tools | Templates
- * and open the template in the editor.
- */
 package burp;
 
 import java.awt.Component;
 import java.io.PrintWriter;
 import java.net.URL;
 import java.security.Security;
+import java.util.Arrays;
 import java.util.List;
+import java.security.SecureRandom;
+
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
-
-
-
 
 /**
  *
@@ -25,6 +21,9 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
  */
 public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyListener, IMessageEditorTabFactory {
     
+    public static final int GCM_TAG_LENGTH = 128; // in bits
+    public static final int GCM_IV_LENGTH = 12;   // in bytes (96 bits is recommended for GCM)
+
     public String ExtensionName =  "AES Killer";
     public String TabName =  "AES Killer";
     public String _Header = "Aes: Killer";
@@ -145,15 +144,34 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
         return _paramString;
     }
     
-    public String do_decrypt(String _enc_str){
-        try{
-            Security.addProvider(new BouncyCastleProvider());
-            cipher = Cipher.getInstance(this._enc_type);
-            //sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key),"AES");
-            //sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key),"GOST3412-2015");
-            String alg = this._enc_type.split("/")[0];
-            sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key),alg);
-            
+   public String do_decrypt(String _enc_str){
+    try{
+        Security.addProvider(new BouncyCastleProvider());
+        cipher = Cipher.getInstance(this._enc_type);
+        String alg = this._enc_type.split("/")[0];
+        sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key), alg);
+        
+        if (this._enc_type.equals("AES/GCM/NoPadding")) {
+            byte[] decoded = this.helpers.base64Decode(_enc_str);
+            // Extract IV and ciphertext+tag
+            byte[] iv = Arrays.copyOfRange(decoded, 0, GCM_IV_LENGTH);
+            byte[] ciphertext = Arrays.copyOfRange(decoded, GCM_IV_LENGTH, decoded.length);
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+            cipher.init(Cipher.DECRYPT_MODE, sec_key, gcmSpec);
+            byte[] decrypted = cipher.doFinal(ciphertext);
+            _enc_str = new String(decrypted);
+        }
+        else if (this._enc_type.equals("AES/ECB/NoPadding")) {
+            cipher.init(Cipher.DECRYPT_MODE, sec_key);
+            if (this._url_enc_dec) { 
+                _enc_str = this.helpers.urlDecode(_enc_str); 
+            }
+            if (this._do_off) { 
+                _enc_str = this.remove_0bff(_enc_str); 
+            }
+            _enc_str = new String(cipher.doFinal(this.helpers.base64Decode(_enc_str)));
+        }
+        else {
             if (this._exclude_iv){
                 cipher.init(Cipher.DECRYPT_MODE, sec_key);
             }
@@ -166,21 +184,51 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
             if (this._do_off) { _enc_str = this.remove_0bff(_enc_str); }
             
             _enc_str = new String (cipher.doFinal(this.helpers.base64Decode(_enc_str)));
-            return _enc_str;
-        }catch(Exception ex){
-            print_error("do_decrypt", ex.getMessage());
-            return _enc_str;
         }
+        return _enc_str;
+    } catch(Exception ex){
+        print_error("do_decrypt", ex.getMessage());
+        return _enc_str;
     }
+}
 
-    public String do_encrypt(String _dec_str){
-        try{
-            cipher = Cipher.getInstance(this._enc_type);
-            String alg = this._enc_type.split("/")[0];
-            sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key),alg);
-            //sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key),"GOST3412-2015");
-            //sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key),"AES");
+public String do_encrypt(String _dec_str){
+    try{
+        cipher = Cipher.getInstance(this._enc_type);
+        String alg = this._enc_type.split("/")[0];
+        sec_key = new SecretKeySpec(this.helpers.base64Decode(this._secret_key), alg);
+        
+        if (this._enc_type.equals("AES/GCM/NoPadding")) {
+            // Generate a random IV
+            byte[] iv = new byte[GCM_IV_LENGTH];
+            SecureRandom random = new SecureRandom();
+            random.nextBytes(iv);
+            GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH, iv);
+            cipher.init(Cipher.ENCRYPT_MODE, sec_key, gcmSpec);
             
+            byte[] encrypted = cipher.doFinal(_dec_str.getBytes());
+            
+            // Prepend IV to the ciphertext
+            byte[] encryptedWithIv = new byte[iv.length + encrypted.length];
+            System.arraycopy(iv, 0, encryptedWithIv, 0, iv.length);
+            System.arraycopy(encrypted, 0, encryptedWithIv, iv.length, encrypted.length);
+            
+            String encoded = this.helpers.base64Encode(encryptedWithIv);
+            
+            if (this._do_off) { encoded = this.do_0bff(encoded); }
+            if (this._url_enc_dec) { encoded = this.helpers.urlEncode(encoded); }
+            return encoded;
+        }
+        else if (this._enc_type.equals("AES/ECB/NoPadding")) {
+            cipher.init(Cipher.ENCRYPT_MODE, sec_key);
+            byte[] encrypted = cipher.doFinal(_dec_str.getBytes());
+            String encoded = this.helpers.base64Encode(encrypted);
+            
+            if (this._do_off) { encoded = this.do_0bff(encoded); }
+            if (this._url_enc_dec) { encoded = this.helpers.urlEncode(encoded); }
+            return encoded;
+        }
+        else {
             if (this._exclude_iv){
                 cipher.init(Cipher.ENCRYPT_MODE, sec_key);
             }
@@ -189,15 +237,19 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
                 cipher.init(Cipher.ENCRYPT_MODE, sec_key, iv_param);
             }
                         
-            _dec_str = new String (this.helpers.base64Encode(cipher.doFinal(_dec_str.getBytes())));
-            if (this._do_off) { _dec_str = this.do_0bff(_dec_str); }
-            if (this._url_enc_dec) { _dec_str = this.helpers.urlEncode(_dec_str); }
-            return _dec_str;
-        }catch(Exception ex){
-            print_error("do_decrypt", ex.getMessage());
-            return _dec_str;
+            byte[] encrypted = cipher.doFinal(_dec_str.getBytes());
+            String encoded = this.helpers.base64Encode(encrypted);
+            
+            if (this._do_off) { encoded = this.do_0bff(encoded); }
+            if (this._url_enc_dec) { encoded = this.helpers.urlEncode(encoded); }
+            return encoded;
         }
+    } catch(Exception ex){
+        print_error("do_encrypt", ex.getMessage());
+        return _dec_str;
     }
+}
+
     
     
     public byte[] update_req_params (byte[] _request, List<String> headers, String[] _params, Boolean _do_enc){
@@ -293,7 +345,6 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
             String URL = new String(reqInfo.getUrl().toString());
             List headers = reqInfo.getHeaders();
             
-            //if(this._host.contains(get_host(URL))) {
             if(URL.contains(this._host)) {
                 
                 if(this._is_req_body) {
@@ -301,7 +352,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
                     String tmpreq = new String(messageInfo.getRequest());
                     String messageBody = new String(tmpreq.substring(reqInfo.getBodyOffset())).trim();
                     String decValue = this.do_decrypt(messageBody);
-                    headers.add(new String(this._Header));
+                    headers.add(this._Header);
                     byte[] updateMessage = helpers.buildHttpMessage(headers, decValue.getBytes());
                     messageInfo.setRequest(updateMessage);
                     print_output("PPM-req", "Final Decrypted Request\n" + new String(updateMessage));
@@ -336,7 +387,6 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
             String URL = new String(reqInfo.getUrl().toString());
             List headers = resInfo.getHeaders();
             
-            //if(this._host.contains(this.get_host(URL))){
             if(URL.contains(this._host)) {
                 
                 if(!headers.contains(this._Header)){ return; }
@@ -392,7 +442,6 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
             
             if(!headers.contains(this._Header)){ return; }
             
-            //if(this._host.contains(get_host(URL))){
             if(URL.contains(this._host)) {
                 if(this._is_req_body) {
                     String tmpreq = new String(messageInfo.getRequest());
@@ -448,7 +497,6 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
             List headers = resInfo.getHeaders();
             
             
-            //if(this._host.contains(this.get_host(URL))){
             if(URL.contains(this._host)) {
                 
                 if(this._is_res_body){
@@ -549,10 +597,9 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
                         URL = reqInfo.getHeaders().get(1).split(" ")[1];
                     }
                     if (URL.contains(_host)) {
-                        //if ((Base64InputTab)this.this$0._is_req_body) {
                         if (BurpExtender.this._is_req_body) {
                             // decrypting request body
-                            String tmpreq = content.toString();
+                            String tmpreq = new String(content);
                             String messageBody = new String(tmpreq.substring(reqInfo.getBodyOffset())).trim();
                             String decValue = do_decrypt(messageBody);
                             txtInput.setText(decValue.getBytes());
@@ -579,7 +626,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IProxyL
                     List headers = respInfo.getHeaders();
                     if (BurpExtender.this._is_req_body) {
                         // decrypting response body
-                        String tmpreq = content.toString();
+                        String tmpreq = new String(content);
                         String messageBody = new String(tmpreq.substring(respInfo.getBodyOffset())).trim();
                         String decValue = do_decrypt(messageBody);
                         txtInput.setText(decValue.getBytes());
